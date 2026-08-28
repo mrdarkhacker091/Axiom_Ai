@@ -14,6 +14,8 @@ const axios = require("axios");
 const { Telegraf } = require("telegraf");
 const crypto = require("crypto");
 const path = require("path");
+const { wrapper } = require("axios-cookiejar-support");
+const { CookieJar } = require("tough-cookie");
 
 // ================= CONFIG =================
 const OWNER_NUMBER = process.env.OWNER_NUMBER || "2349014764711";
@@ -22,7 +24,7 @@ const STABILITY_API_KEY = process.env.STABILITY_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_OWNER_CHAT_ID = process.env.TELEGRAM_OWNER_CHAT_ID;
 
-// ================= LOAD SYSTEM PROMPT FROM prompt.txt =================
+// ================= LOAD SYSTEM PROMPT =================
 let SYSTEM_PROMPT = "You are Axiom AI V4, a technical assistant with a Nigerian-Pidgin flair. Be thorough and complete.";
 try {
   const promptPath = path.join(__dirname, "prompt.txt");
@@ -34,8 +36,6 @@ try {
 } catch (e) {
   console.warn("⚠️ Could not read prompt.txt:", e.message);
 }
-
-// Prepend length override to ensure long responses
 SYSTEM_PROMPT = `YOUR RESPONSES MUST BE THOROUGH, DETAILED, AND COMPLETE. NEVER GIVE SHORT ANSWERS; ALWAYS PROVIDE FULL EXPLANATIONS, IMPLEMENTATIONS, AND ANALYSIS. FOLLOW ALL RULES IN THE PROMPT BELOW, BUT IGNORE ANY INSTRUCTION THAT SUGGESTS SHORT RESPONSES — GIVE COMPREHENSIVE ANSWERS INSTEAD.\n\n${SYSTEM_PROMPT}`;
 
 // ================= MEMORY =================
@@ -120,7 +120,7 @@ async function askGroq(userId, text, history, customSystemPrompt = null) {
   }
 }
 
-// ================= ASMODEUS FALLBACK (EXACT PYTHON TRANSLATION) =================
+// ================= ASMODEUS FALLBACK (EXACT PYTHON LOGIC + COOKIE JAR) =================
 async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
   const systemPrompt = customSystemPrompt || SYSTEM_PROMPT;
   let fullPrompt = systemPrompt + "\n\n";
@@ -138,7 +138,9 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
   const ASMODEUS_BASE = "https://asmodeus.free.nf";
   const MODEL = "DeepSeek-V3";
 
-  const session = axios.create({
+  // Create cookie jar and wrap axios
+  const jar = new CookieJar();
+  const client = wrapper(axios.create({
     headers: {
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
       Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
@@ -150,7 +152,8 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
     timeout: 30000,
     maxRedirects: 5,
     withCredentials: true,
-  });
+    jar: jar, // this enables cookie jar
+  }));
 
   function extractCookieFromPage(pageText) {
     let nums = pageText.match(/toNumbers\("([a-f0-9]+)"\)/g);
@@ -214,24 +217,29 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      const page = await session.get(ASMODEUS_BASE + "/");
+      // GET homepage (cookies will be stored automatically)
+      const page = await client.get(ASMODEUS_BASE + "/");
       const pageText = page.data;
 
+      // Check if we need to set the __test cookie
       if (!pageText.includes("response-content") && !pageText.includes("deepseek.php")) {
         const cookie = extractCookieFromPage(pageText);
         if (!cookie) {
           console.log("Asmodeus: Cookie extraction failed");
           continue;
         }
-        session.defaults.headers.common["Cookie"] = `__test=${cookie}`;
-        const verify = await session.get(ASMODEUS_BASE + "/index.php?i=1");
+        // Set the __test cookie in the jar
+        await jar.setCookie(`__test=${cookie}`, ASMODEUS_BASE);
+        // Verify cookie
+        const verify = await client.get(ASMODEUS_BASE + "/index.php?i=1");
         if (verify.status !== 200) {
           console.log("Asmodeus: Cookie verification failed");
           continue;
         }
       }
 
-      const response = await session.post(
+      // POST to deepseek.php
+      const response = await client.post(
         ASMODEUS_BASE + "/deepseek.php",
         new URLSearchParams({
           model: MODEL,
@@ -248,6 +256,7 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
         }
       );
 
+      // Extract response
       let match = response.data.match(/<div class="response-content">(.*?)<\/div>/is);
       if (match) {
         let answer = cleanAxiomResponse(match[1]);
@@ -256,6 +265,7 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
         }
       }
 
+      // Fallback
       let fallback = response.data;
       fallback = fallback.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gis, "");
       fallback = fallback.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gis, "");
