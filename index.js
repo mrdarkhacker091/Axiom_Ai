@@ -24,6 +24,21 @@ const STABILITY_API_KEY = process.env.STABILITY_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_OWNER_CHAT_ID = process.env.TELEGRAM_OWNER_CHAT_ID;
 
+// Groq model — use a real, currently-supported model ID.
+// "qwen/qwen3.8-27b" does not exist and was silently causing failures.
+// Swap this if you want a different model (see console.groq.com/docs/models):
+//   llama-3.3-70b-versatile   (best general purpose)
+//   llama-3.1-8b-instant      (fastest / cheapest)
+//   qwen/qwen3-32b
+//   openai/gpt-oss-20b
+const GROQ_MODEL = "qwen/qwen3.8-27b";
+
+// Payload budgets (characters, not tokens — conservative so we never hit 413)
+const MAX_SYSTEM_PROMPT_CHARS = 6000;
+const MAX_HISTORY_CHARS = 6000;
+const MAX_USER_TEXT_CHARS = 3000;
+const MAX_STORED_MSG_CHARS = 3000;
+
 console.log("🔑 GROQ_API_KEY present:", !!GROQ_API_KEY);
 console.log("🔑 STABILITY_API_KEY present:", !!STABILITY_API_KEY);
 
@@ -45,16 +60,31 @@ async function sendTelegramLog(message, isError = false) {
   }
 }
 
-// ================= LOAD SYSTEM PROMPT (UNTRIMMED) =================
-let SYSTEM_PROMPT = "You are Axiom AI V4, a technical assistant with a Nigerian-Pidgin flair. Be thorough and complete.";
+// ================= LOAD SYSTEM PROMPT (CAPPED) =================
+let SYSTEM_PROMPT = "You are Axiom AI V4, a technical assistant with a Nigerian-Pidgin flair.";
 
 async function loadSystemPrompt() {
   try {
     const promptPath = path.join(__dirname, "prompt.txt");
     if (fs.existsSync(promptPath)) {
-      SYSTEM_PROMPT = fs.readFileSync(promptPath, "utf8");
-      console.log(`✅ System prompt loaded (${SYSTEM_PROMPT.length} chars)`);
-      await sendTelegramLog(`✅ System prompt loaded (${SYSTEM_PROMPT.length} chars)`);
+      const raw = fs.readFileSync(promptPath, "utf8");
+      console.log(`📄 prompt.txt raw size: ${raw.length} chars`);
+
+      if (raw.length > MAX_SYSTEM_PROMPT_CHARS) {
+        SYSTEM_PROMPT = raw.slice(0, MAX_SYSTEM_PROMPT_CHARS);
+        console.warn(
+          `⚠️ prompt.txt (${raw.length} chars) exceeds MAX_SYSTEM_PROMPT_CHARS (${MAX_SYSTEM_PROMPT_CHARS}). Truncated.`
+        );
+        await sendTelegramLog(
+          `⚠️ prompt.txt truncated from ${raw.length} to ${MAX_SYSTEM_PROMPT_CHARS} chars. ` +
+          `This was very likely the cause of your 413 errors — consider shortening prompt.txt permanently.`,
+          true
+        );
+      } else {
+        SYSTEM_PROMPT = raw;
+        console.log(`✅ System prompt loaded (${SYSTEM_PROMPT.length} chars)`);
+        await sendTelegramLog(`✅ System prompt loaded (${SYSTEM_PROMPT.length} chars)`);
+      }
     } else {
       console.warn("⚠️ prompt.txt not found. Using default minimal prompt.");
       await sendTelegramLog("⚠️ prompt.txt not found. Using default minimal prompt.");
@@ -63,7 +93,6 @@ async function loadSystemPrompt() {
     console.warn("⚠️ Could not read prompt.txt:", e.message);
     await sendTelegramLog(`⚠️ Could not read prompt.txt: ${e.message}`, true);
   }
-  // DO NOT prepend any extra text – keep prompt.txt as-is.
 }
 
 // ================= MEMORY =================
@@ -117,9 +146,7 @@ function cleanAxiomResponse(text) {
 }
 
 // ================= HISTORY TRIMMING (by character budget) =================
-function trimHistory(history, maxChars = 8000) {
-  // Start from the end and accumulate messages until we hit the budget.
-  // Returns an array of messages in chronological order.
+function trimHistory(history, maxChars = MAX_HISTORY_CHARS) {
   let total = 0;
   const kept = [];
   for (let i = history.length - 1; i >= 0; i--) {
@@ -135,14 +162,11 @@ function trimHistory(history, maxChars = 8000) {
 
 // ================= AI FUNCTIONS =================
 
-// GROQ PRIMARY – with history trimming and payload size limits
+// GROQ PRIMARY
 async function askGroq(userId, text, history, customSystemPrompt = null) {
-  const systemPrompt = customSystemPrompt || SYSTEM_PROMPT;
-  const MAX_USER_TEXT = 3000;
-  const userText = text.slice(0, MAX_USER_TEXT);
-
-  // Trim history to ~8000 chars total
-  const trimmedHistory = trimHistory(history, 8000);
+  const systemPrompt = (customSystemPrompt || SYSTEM_PROMPT).slice(0, MAX_SYSTEM_PROMPT_CHARS);
+  const userText = text.slice(0, MAX_USER_TEXT_CHARS);
+  const trimmedHistory = trimHistory(history, MAX_HISTORY_CHARS);
 
   const messages = [
     { role: "system", content: systemPrompt },
@@ -150,18 +174,20 @@ async function askGroq(userId, text, history, customSystemPrompt = null) {
     { role: "user", content: userText },
   ];
 
-  // Log payload sizes for debugging
   const totalPayload = messages.reduce((sum, m) => sum + (m.content || "").length, 0);
-  console.log(`📤 Groq payload: ${totalPayload} chars, system=${systemPrompt.length}, history=${trimmedHistory.reduce((s,m) => s + (m.content||"").length, 0)}, user=${userText.length}`);
+  console.log(
+    `📤 Groq payload: ${totalPayload} chars total ` +
+    `(system=${systemPrompt.length}, history=${trimmedHistory.reduce((s, m) => s + (m.content || "").length, 0)}, user=${userText.length})`
+  );
 
   try {
     const response = await axios.post(
       "https://api.groq.com/openai/v1/chat/completions",
       {
-        model: "qwen/qwen3.8-27b",
+        model: GROQ_MODEL,
         messages,
         temperature: 0.8,
-        max_tokens: 2048, // Reduced from 4096 to avoid output bloat
+        max_tokens: 2048,
       },
       {
         headers: {
@@ -186,7 +212,7 @@ async function askGroq(userId, text, history, customSystemPrompt = null) {
   }
 }
 
-// ================= ASMODEUS FALLBACK (with history trimming and detailed logging) =================
+// ================= ASMODEUS FALLBACK =================
 function createAsmodeusClient() {
   const jar = new CookieJar();
   const client = wrapper(
@@ -212,8 +238,6 @@ function createAsmodeusClient() {
     console.log("METHOD:", config.method?.toUpperCase());
     console.log("URL:", config.baseURL || "", config.url);
     console.log("PARAMS:", config.params);
-    console.log("HEADERS:", config.headers);
-    console.log("BODY:", typeof config.data === "string" ? config.data.slice(0, 1000) : config.data);
     try {
       console.log("COOKIES:", await jar.getCookieString(ASMODEUS_BASE + "/"));
     } catch (e) {}
@@ -225,28 +249,14 @@ function createAsmodeusClient() {
     async (response) => {
       console.log("\n========== ASMODEUS RESPONSE ==========");
       console.log("STATUS:", response.status);
-      console.log("URL:", response.config?.url);
-      console.log("HEADERS:", response.headers);
-      console.log("BODY:", typeof response.data === "string" ? response.data.slice(0, 2000) : response.data);
+      console.log("BODY:", typeof response.data === "string" ? response.data.slice(0, 1500) : response.data);
       console.log("========================================\n");
       return response;
     },
     async (error) => {
       console.log("\n========== ASMODEUS ERROR ==========");
       console.error("MESSAGE:", error.message);
-      console.error("CODE:", error.code);
       console.error("STATUS:", error.response?.status);
-      if (error.config) {
-        console.error("REQUEST URL:", error.config.url);
-        console.error("REQUEST METHOD:", error.config.method?.toUpperCase());
-        console.error("REQUEST PARAMS:", error.config.params);
-        console.error("REQUEST HEADERS:", error.config.headers);
-        console.error("REQUEST BODY:", error.config.data);
-      }
-      if (error.response) {
-        console.error("RESPONSE HEADERS:", error.response.headers);
-        console.error("RESPONSE BODY:", typeof error.response.data === "string" ? error.response.data.slice(0, 5000) : error.response.data);
-      }
       console.log("====================================\n");
       return Promise.reject(error);
     }
@@ -285,12 +295,9 @@ function extractCookieFromPage(pageText) {
 }
 
 async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
-  const systemPrompt = customSystemPrompt || SYSTEM_PROMPT;
-  const MAX_USER_TEXT = 3000;
-  const userText = text.slice(0, MAX_USER_TEXT);
-
-  // Trim history for Asmodeus as well (to keep prompt size manageable)
-  const trimmedHistory = trimHistory(history, 8000);
+  const systemPrompt = (customSystemPrompt || SYSTEM_PROMPT).slice(0, MAX_SYSTEM_PROMPT_CHARS);
+  const userText = text.slice(0, MAX_USER_TEXT_CHARS);
+  const trimmedHistory = trimHistory(history, MAX_HISTORY_CHARS);
 
   let fullPrompt = systemPrompt + "\n\n";
   const now = new Date();
@@ -311,13 +318,10 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       console.log(`\n========== ASMODEUS ATTEMPT ${attempt + 1} ==========`);
-      // GET homepage
       const page = await client.get(ASMODEUS_BASE + "/");
       const pageText = typeof page.data === "string" ? page.data : String(page.data);
       console.log("🏠 Homepage length:", pageText.length);
-      console.log("🏠 Homepage preview:", pageText.slice(0, 500));
 
-      // Check if we need the __test cookie
       if (!pageText.includes("response-content") && !pageText.includes("deepseek.php")) {
         console.log("🍪 Asmodeus appears to require __test cookie");
         const cookie = extractCookieFromPage(pageText);
@@ -325,20 +329,14 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
           console.log("❌ Cookie extraction failed");
           continue;
         }
-        console.log("✅ Cookie extracted");
         await jar.setCookie(`__test=${cookie}; Domain=asmodeus.free.nf; Path=/`, ASMODEUS_BASE + "/");
-        console.log("🍪 Cookie jar:", await jar.getCookieString(ASMODEUS_BASE + "/"));
-
-        // Verify cookie
         const verify = await client.get(ASMODEUS_BASE + "/index.php?i=1");
-        console.log("Cookie verification status:", verify.status);
         if (verify.status !== 200) {
           console.log("❌ Cookie verification failed");
           continue;
         }
       }
 
-      // POST request
       const body = new URLSearchParams();
       body.append("model", MODEL);
       body.append("question", fullPrompt);
@@ -357,12 +355,9 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
         }
       );
 
-      console.log("✅ Asmodeus HTTP status:", response.status);
       const raw = typeof response.data === "string" ? response.data : JSON.stringify(response.data);
       console.log("Response length:", raw.length);
-      console.log("Response preview:", raw.slice(0, 3000));
 
-      // Parse response-content
       const match = raw.match(/<div[^>]*class=["']response-content["'][^>]*>([\s\S]*?)<\/div>/i);
       if (match) {
         const answer = cleanAxiomResponse(match[1]);
@@ -373,7 +368,6 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
         }
       }
 
-      // Fallback parser
       let fallback = raw;
       fallback = fallback.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gis, "");
       fallback = fallback.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gis, "");
@@ -389,25 +383,9 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
 
       console.log("❌ Asmodeus returned no usable answer");
     } catch (err) {
-      console.error(`\n❌ ASMODEUS ATTEMPT ${attempt + 1} FAILED`);
-      console.error("Message:", err.message);
-      console.error("Code:", err.code);
-      console.error("Status:", err.response?.status);
-      if (err.response?.data) {
-        console.error("Response:", typeof err.response.data === "string" ? err.response.data.slice(0, 5000) : err.response.data);
-      }
-      if (err.config) {
-        console.error("URL:", err.config.url);
-        console.error("Method:", err.config.method);
-        console.error("Params:", err.config.params);
-      }
-      console.error("Stack:", err.stack);
-
+      console.error(`❌ Asmodeus attempt ${attempt + 1} failed:`, err.message);
       await sendTelegramLog(
-        `Asmodeus attempt ${attempt + 1} failed\n` +
-        `Status: ${err.response?.status || "N/A"}\n` +
-        `Code: ${err.code || "N/A"}\n` +
-        `Message: ${err.message}`,
+        `Asmodeus attempt ${attempt + 1} failed\nStatus: ${err.response?.status || "N/A"}\nMessage: ${err.message}`,
         true
       );
     }
@@ -441,15 +419,12 @@ async function askAI(userId, text, isOwner = false) {
     }
   }
 
-  // Store messages, but truncate to avoid future bloat
-  const MAX_MSG_LEN = 3000;
-  const userMsg = text.slice(0, MAX_MSG_LEN);
-  const assistantMsg = reply.slice(0, MAX_MSG_LEN);
+  const userMsg = text.slice(0, MAX_STORED_MSG_CHARS);
+  const assistantMsg = reply.slice(0, MAX_STORED_MSG_CHARS);
 
   history.push({ role: "user", content: userMsg });
   history.push({ role: "assistant", content: assistantMsg });
 
-  // Keep only the last 20 messages (but we already trim by character in the next request)
   if (history.length > 20) {
     memory[userId] = history.slice(-20);
   } else {
