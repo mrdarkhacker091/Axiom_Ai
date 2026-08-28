@@ -27,6 +27,24 @@ const TELEGRAM_OWNER_CHAT_ID = process.env.TELEGRAM_OWNER_CHAT_ID;
 console.log("🔑 GROQ_API_KEY present:", !!GROQ_API_KEY);
 console.log("🔑 STABILITY_API_KEY present:", !!STABILITY_API_KEY);
 
+// ================= TELEGRAM NOTIFICATION HELPER =================
+async function sendTelegramLog(message, isError = false) {
+  if (!TELEGRAM_BOT_TOKEN || !TELEGRAM_OWNER_CHAT_ID) return;
+  try {
+    const prefix = isError ? "❌ ERROR: " : "📢 ";
+    await axios.post(
+      `https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage`,
+      {
+        chat_id: TELEGRAM_OWNER_CHAT_ID,
+        text: prefix + message.slice(0, 4000),
+        parse_mode: "Markdown",
+      }
+    );
+  } catch (e) {
+    console.error("Failed to send Telegram log:", e.message);
+  }
+}
+
 // ================= LOAD SYSTEM PROMPT =================
 let SYSTEM_PROMPT = "You are Axiom AI V4, a technical assistant with a Nigerian-Pidgin flair. Be thorough and complete.";
 try {
@@ -34,8 +52,10 @@ try {
   if (fs.existsSync(promptPath)) {
     SYSTEM_PROMPT = fs.readFileSync(promptPath, "utf8");
     console.log("✅ System prompt loaded from prompt.txt");
+    await sendTelegramLog("✅ System prompt loaded from prompt.txt");
   } else {
     console.warn("⚠️ prompt.txt not found. Using default minimal prompt.");
+    await sendTelegramLog("⚠️ prompt.txt not found. Using default minimal prompt.");
   }
 } catch (e) {
   console.warn("⚠️ Could not read prompt.txt:", e.message);
@@ -57,7 +77,7 @@ function saveMemory() {
   fs.writeFileSync(MEMORY_FILE, JSON.stringify(memory, null, 2));
 }
 
-// ================= CLEAN AI RESPONSE (exact Python match) =================
+// ================= CLEAN AI RESPONSE =================
 function cleanAxiomResponse(text) {
   if (!text) return "";
   text = text.replace(/<think>.*?<\/think>/gis, "");
@@ -93,7 +113,7 @@ function cleanAxiomResponse(text) {
 
 // ================= AI FUNCTIONS =================
 
-// GROQ PRIMARY – FIXED MODEL
+// GROQ PRIMARY – using valid model from your list
 async function askGroq(userId, text, history, customSystemPrompt = null) {
   const systemPrompt = customSystemPrompt || SYSTEM_PROMPT;
   const messages = [
@@ -105,8 +125,7 @@ async function askGroq(userId, text, history, customSystemPrompt = null) {
     const response = await axios.post(
       "https://api.groq.com/openai/v1/chat/completions",
       {
-        // ✅ Valid model – choose one:
-        model: "llama3-70b-8192", // or "llama-3.3-70b-versatile"
+        model: "qwen/qwen3.8-27b", // Fastest general-purpose model available
         messages,
         temperature: 0.8,
         max_tokens: 4096,
@@ -116,24 +135,127 @@ async function askGroq(userId, text, history, customSystemPrompt = null) {
           Authorization: `Bearer ${GROQ_API_KEY}`,
           "Content-Type": "application/json",
         },
-        timeout: 30000, // 30 seconds
+        timeout: 30000,
       }
     );
-    return response.data.choices[0].message.content;
+    const reply = response.data.choices[0].message.content;
+    console.log("✅ Groq succeeded");
+    return reply;
   } catch (err) {
     console.error("❌ Groq error:", err.response?.data || err.message);
+    await sendTelegramLog(`Groq error: ${err.message}`, true);
     return null;
   }
 }
 
-// ================= ASMODEUS FALLBACK (FULL DEBUG VERSION) =================
+// ================= ASMODEUS FALLBACK (with interceptor-based client) =================
+// We reuse the logging client from your snippet
+
+function createAsmodeusClient() {
+  const jar = new CookieJar();
+  const client = wrapper(
+    axios.create({
+      jar,
+      withCredentials: true,
+      timeout: 90000,
+      maxRedirects: 5,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) " +
+          "AppleWebKit/537.36 (KHTML, like Gecko) " +
+          "Chrome/120.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;" +
+          "q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "X-Requested-With": "XMLHttpRequest",
+      },
+    })
+  );
+
+  // ===============================
+  // LOG OUTGOING REQUEST
+  // ===============================
+  client.interceptors.request.use(async (config) => {
+    console.log("\n========== ASMODEUS REQUEST ==========");
+    console.log("METHOD:", config.method?.toUpperCase());
+    console.log("URL:", config.baseURL || "", config.url);
+    console.log("PARAMS:", config.params);
+    console.log("HEADERS:", config.headers);
+    console.log("BODY:", typeof config.data === "string" ? config.data : JSON.stringify(config.data));
+    try {
+      console.log("COOKIES:", await jar.getCookieString(ASMODEUS_BASE + "/"));
+    } catch (e) {}
+    console.log("======================================\n");
+    return config;
+  });
+
+  // ===============================
+  // LOG RESPONSE
+  // ===============================
+  client.interceptors.response.use(
+    async (response) => {
+      console.log("\n========== ASMODEUS RESPONSE ==========");
+      console.log("STATUS:", response.status);
+      console.log("URL:", response.config?.url);
+      console.log("HEADERS:", response.headers);
+      console.log("BODY:", typeof response.data === "string" ? response.data.slice(0, 2000) : response.data);
+      console.log("========================================\n");
+      return response;
+    },
+    async (error) => {
+      console.log("\n========== ASMODEUS ERROR ==========");
+      console.log("MESSAGE:", error.message);
+      console.log("CODE:", error.code);
+      console.log("STATUS:", error.response?.status);
+      if (error.config) {
+        console.log("REQUEST URL:", error.config.url);
+        console.log("REQUEST METHOD:", error.config.method?.toUpperCase());
+        console.log("REQUEST PARAMS:", error.config.params);
+        console.log("REQUEST HEADERS:", error.config.headers);
+        console.log("REQUEST BODY:", error.config.data);
+      }
+      if (error.response) {
+        console.log("RESPONSE HEADERS:", error.response.headers);
+        console.log("RESPONSE BODY:", typeof error.response.data === "string" ? error.response.data.slice(0, 2000) : error.response.data);
+      }
+      console.log("====================================\n");
+      return Promise.reject(error);
+    }
+  );
+
+  return { client, jar };
+}
+
+function extractCookieFromPage(pageText) {
+  const patterns = [
+    /toNumbers\("([a-f0-9]+)"\)/g,
+    /toNumbers\('([a-f0-9]+)'\)/g,
+    /toNumbers\s*\(\s*["']([a-f0-9]{32,})["']\s*\)/g,
+    /["']([a-f0-9]{32,})["']/g,
+  ];
+  for (const pattern of patterns) {
+    const matches = [...pageText.matchAll(pattern)];
+    if (matches.length >= 3) {
+      try {
+        const key = Buffer.from(matches[0][1], "hex");
+        const iv = Buffer.from(matches[1][1], "hex");
+        const data = Buffer.from(matches[2][1], "hex");
+        const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
+        decipher.setAutoPadding(true);
+        const decrypted = Buffer.concat([decipher.update(data), decipher.final()]);
+        return decrypted.toString("hex");
+      } catch (e) {
+        console.log("Cookie decrypt failed:", e.message);
+      }
+    }
+  }
+  return null;
+}
+
 async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
   const systemPrompt = customSystemPrompt || SYSTEM_PROMPT;
-
   let fullPrompt = systemPrompt + "\n\n";
   const now = new Date();
   fullPrompt += `Current time: ${now.toLocaleTimeString()}\n`;
-
   if (history.length) {
     fullPrompt += "Recent chat:\n";
     for (const msg of history.slice(-10)) {
@@ -146,87 +268,31 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
   const ASMODEUS_BASE = "https://asmodeus.free.nf";
   const MODEL = "DeepSeek-V3";
 
-  const jar = new CookieJar();
-  const client = wrapper(
-    axios.create({
-      jar,
-      withCredentials: true,
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        DNT: "1",
-        Connection: "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-      },
-      timeout: 30000,
-      maxRedirects: 5,
-    })
-  );
-
-  function extractCookieFromPage(pageText) {
-    const patterns = [
-      /toNumbers\("([a-f0-9]+)"\)/g,
-      /toNumbers\('([a-f0-9]+)'\)/g,
-      /toNumbers\s*\(\s*["']([a-f0-9]{32,})["']\s*\)/g,
-      /["']([a-f0-9]{32,})["']/g,
-    ];
-    for (const pattern of patterns) {
-      const matches = [...pageText.matchAll(pattern)];
-      if (matches.length >= 3) {
-        try {
-          const key = Buffer.from(matches[0][1], "hex");
-          const iv = Buffer.from(matches[1][1], "hex");
-          const data = Buffer.from(matches[2][1], "hex");
-          const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
-          decipher.setAutoPadding(true);
-          const decrypted = Buffer.concat([decipher.update(data), decipher.final()]);
-          return decrypted.toString("hex");
-        } catch (e) {
-          console.log("Cookie decrypt failed:", e.message);
-        }
-      }
-    }
-    return null;
-  }
+  const { client, jar } = createAsmodeusClient();
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       console.log(`\n========== ASMODEUS ATTEMPT ${attempt + 1} ==========`);
-
       // GET homepage
-      console.log("🌐 GET:", ASMODEUS_BASE + "/");
       const page = await client.get(ASMODEUS_BASE + "/");
-      console.log("Homepage status:", page.status);
       const pageText = typeof page.data === "string" ? page.data : String(page.data);
-      console.log("Homepage length:", pageText.length);
 
-      // Cookie
+      // Check if cookie needed
       if (!pageText.includes("response-content") && !pageText.includes("deepseek.php")) {
-        console.log("🍪 Asmodeus appears to require __test cookie");
         const cookie = extractCookieFromPage(pageText);
         if (!cookie) {
           console.log("❌ Cookie extraction failed");
           continue;
         }
-        console.log("✅ Cookie extracted");
         await jar.setCookie(`__test=${cookie}; Domain=asmodeus.free.nf; Path=/`, ASMODEUS_BASE + "/");
-        console.log("🍪 Cookie jar:", await jar.getCookieString(ASMODEUS_BASE + "/"));
-
-        // Verify
         const verify = await client.get(ASMODEUS_BASE + "/index.php?i=1");
-        console.log("Cookie verification:", verify.status);
         if (verify.status !== 200) {
           console.log("❌ Cookie verification failed");
           continue;
         }
       }
 
-      // POST
-      console.log("🚀 POST:", ASMODEUS_BASE + "/deepseek.php");
-      console.log("Model:", MODEL);
-      console.log("Prompt length:", fullPrompt.length);
-
+      // POST request
       const body = new URLSearchParams();
       body.append("model", MODEL);
       body.append("question", fullPrompt);
@@ -242,23 +308,18 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
             Origin: ASMODEUS_BASE,
             Referer: ASMODEUS_BASE + "/",
           },
-          timeout: 90000,
         }
       );
 
-      console.log("✅ Asmodeus HTTP status:", response.status);
-      console.log("Content-Type:", response.headers["content-type"]);
       const raw = typeof response.data === "string" ? response.data : JSON.stringify(response.data);
-      console.log("Response length:", raw.length);
-      console.log("Response preview:", raw.slice(0, 3000));
 
       // Parse response-content
       const match = raw.match(/<div[^>]*class=["']response-content["'][^>]*>([\s\S]*?)<\/div>/i);
       if (match) {
         const answer = cleanAxiomResponse(match[1]);
-        console.log("Parsed answer length:", answer.length);
         if (answer.length > 1) {
           console.log("✅ Asmodeus response received");
+          await sendTelegramLog("✅ Asmodeus fallback succeeded");
           return answer;
         }
       }
@@ -273,20 +334,19 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
       fallback = fallback.replace(/\s+/g, " ").trim();
       if (fallback.length > 20 && !fallback.toLowerCase().includes("error")) {
         console.log("✅ Asmodeus fallback parser succeeded");
+        await sendTelegramLog("✅ Asmodeus fallback parser succeeded");
         return fallback;
       }
 
       console.log("❌ Asmodeus returned no usable answer");
     } catch (err) {
-      console.error(`❌ Asmodeus attempt ${attempt + 1} failed`);
-      console.error("Error:", err.message);
-      console.error("Code:", err.code);
-      console.error("Status:", err.response?.status);
-      console.error("Response:", typeof err.response?.data === "string" ? err.response.data.slice(0, 3000) : err.response?.data);
+      console.error(`❌ Asmodeus attempt ${attempt + 1} failed:`, err.message);
+      await sendTelegramLog(`Asmodeus attempt ${attempt+1} failed: ${err.message}`, true);
     }
   }
 
   console.log("❌ ALL ASMODEUS ATTEMPTS FAILED");
+  await sendTelegramLog("❌ ALL ASMODEUS ATTEMPTS FAILED", true);
   return null;
 }
 
@@ -305,9 +365,11 @@ async function askAI(userId, text, isOwner = false) {
   let reply = await askGroq(userId, text, history, customPrompt);
   if (!reply) {
     console.log("🔄 Groq failed, falling back to Asmodeus");
+    await sendTelegramLog("🔄 Groq failed, falling back to Asmodeus");
     reply = await askAsmodeus(userId, text, history, customPrompt);
     if (!reply) {
       reply = "⚠️ Both AI providers are currently unavailable. Please try again later.";
+      await sendTelegramLog("⚠️ Both AI providers failed", true);
     }
   }
 
@@ -360,7 +422,8 @@ telegramBot.command("pair", async (ctx) => {
   if (!waSocket) return ctx.reply("⚠️ WhatsApp not ready.");
   try {
     const code = await waSocket.requestPairingCode(number);
-    await ctx.reply(`🔐 Pairing code for ${number}:\n\`${code}\`\n\nUse in WhatsApp > Linked Devices > Link with phone number.`);
+    // Send as plain text in a code block for easy copying
+    await ctx.reply(`🔐 Pairing code for ${number}:\n\`\`\`\n${code}\n\`\`\`\nUse this code in WhatsApp > Linked Devices > Link with phone number.`);
   } catch (err) {
     await ctx.reply(`❌ Failed: ${err.message}`);
   }
@@ -406,7 +469,10 @@ telegramBot.command("ls", async (ctx) => {
   }
 });
 
-telegramBot.launch().then(() => console.log("📱 Telegram bot started")).catch(err => console.error("Telegram error:", err));
+telegramBot.launch().then(() => {
+  console.log("📱 Telegram bot started");
+  sendTelegramLog("📱 Telegram bot started");
+}).catch(err => console.error("Telegram error:", err));
 
 // ================= WHATSAPP BOT =================
 async function startWhatsApp() {
@@ -433,17 +499,19 @@ async function startWhatsApp() {
     const { connection, lastDisconnect } = update;
     if (connection === "open") {
       console.log("✅ WhatsApp Connected");
-      try { await telegramBot.telegram.sendMessage(TELEGRAM_OWNER_CHAT_ID, "✅ WhatsApp bot online!"); } catch {}
+      await sendTelegramLog("✅ WhatsApp bot online!");
     }
     if (connection === "close") {
       const reason = lastDisconnect?.error?.output?.statusCode;
       console.log("❌ Connection Closed:", reason);
+      await sendTelegramLog(`❌ WhatsApp connection closed: ${reason}`, true);
       if (reason === DisconnectReason.loggedOut) {
         console.log("🚪 Logged out.");
-        try { await telegramBot.telegram.sendMessage(TELEGRAM_OWNER_CHAT_ID, "⚠️ WhatsApp logged out. Restart."); } catch {}
+        await sendTelegramLog("🚪 WhatsApp logged out. Restart required.", true);
         return;
       }
       console.log("🔄 Reconnecting in 8s...");
+      await sendTelegramLog("🔄 Reconnecting in 8s...");
       setTimeout(startWhatsApp, 8000);
     }
   });
@@ -491,7 +559,6 @@ async function startWhatsApp() {
       const reply = await askAI(userId, text, isOwner);
       console.log(`🤖 AI reply: ${reply.slice(0, 100)}...`);
 
-      // Send WhatsApp reply
       await sock.sendMessage(remoteJid, { text: reply });
       console.log(`✅ Replied to ${senderJid}`);
     } catch (err) {
@@ -499,13 +566,17 @@ async function startWhatsApp() {
       console.error(err);
       console.error("Stack:", err.stack);
       console.error("===================================");
+      await sendTelegramLog(`Message error: ${err.message}`, true);
     }
   });
 
   return sock;
 }
 
-startWhatsApp().catch(err => console.error("Start error:", err));
+startWhatsApp().catch(err => {
+  console.error("Start error:", err);
+  sendTelegramLog(`Start error: ${err.message}`, true);
+});
 
 process.on("SIGINT", () => {
   console.log("Shutting down...");
