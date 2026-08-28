@@ -24,12 +24,16 @@ const STABILITY_API_KEY = process.env.STABILITY_API_KEY;
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const TELEGRAM_OWNER_CHAT_ID = process.env.TELEGRAM_OWNER_CHAT_ID;
 
+console.log("🔑 GROQ_API_KEY present:", !!GROQ_API_KEY);
+console.log("🔑 STABILITY_API_KEY present:", !!STABILITY_API_KEY);
+
 // ================= LOAD SYSTEM PROMPT =================
 let SYSTEM_PROMPT = "You are Axiom AI V4, a technical assistant with a Nigerian-Pidgin flair. Be thorough and complete.";
 try {
   const promptPath = path.join(__dirname, "prompt.txt");
   if (fs.existsSync(promptPath)) {
     SYSTEM_PROMPT = fs.readFileSync(promptPath, "utf8");
+    console.log("✅ System prompt loaded from prompt.txt");
   } else {
     console.warn("⚠️ prompt.txt not found. Using default minimal prompt.");
   }
@@ -89,7 +93,7 @@ function cleanAxiomResponse(text) {
 
 // ================= AI FUNCTIONS =================
 
-// Groq primary
+// GROQ PRIMARY – FIXED MODEL
 async function askGroq(userId, text, history, customSystemPrompt = null) {
   const systemPrompt = customSystemPrompt || SYSTEM_PROMPT;
   const messages = [
@@ -101,7 +105,8 @@ async function askGroq(userId, text, history, customSystemPrompt = null) {
     const response = await axios.post(
       "https://api.groq.com/openai/v1/chat/completions",
       {
-        model: "qwen/qwen3.8-27b",
+        // ✅ Valid model – choose one:
+        model: "llama3-70b-8192", // or "llama-3.3-70b-versatile"
         messages,
         temperature: 0.8,
         max_tokens: 4096,
@@ -111,21 +116,24 @@ async function askGroq(userId, text, history, customSystemPrompt = null) {
           Authorization: `Bearer ${GROQ_API_KEY}`,
           "Content-Type": "application/json",
         },
+        timeout: 30000, // 30 seconds
       }
     );
     return response.data.choices[0].message.content;
   } catch (err) {
-    console.log("Groq error:", err.response?.data || err.message);
+    console.error("❌ Groq error:", err.response?.data || err.message);
     return null;
   }
 }
 
-// ================= ASMODEUS FALLBACK (EXACT PYTHON LOGIC + COOKIE JAR) =================
+// ================= ASMODEUS FALLBACK (FULL DEBUG VERSION) =================
 async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
   const systemPrompt = customSystemPrompt || SYSTEM_PROMPT;
+
   let fullPrompt = systemPrompt + "\n\n";
   const now = new Date();
   fullPrompt += `Current time: ${now.toLocaleTimeString()}\n`;
+
   if (history.length) {
     fullPrompt += "Recent chat:\n";
     for (const msg of history.slice(-10)) {
@@ -138,113 +146,94 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
   const ASMODEUS_BASE = "https://asmodeus.free.nf";
   const MODEL = "DeepSeek-V3";
 
-  // Create cookie jar and wrap axios
   const jar = new CookieJar();
-  const client = wrapper(axios.create({
-    headers: {
-      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-      "Accept-Language": "en-US,en;q=0.5",
-      DNT: "1",
-      Connection: "keep-alive",
-      "Upgrade-Insecure-Requests": "1",
-    },
-    timeout: 30000,
-    maxRedirects: 5,
-    withCredentials: true,
-    jar: jar, // this enables cookie jar
-  }));
+  const client = wrapper(
+    axios.create({
+      jar,
+      withCredentials: true,
+      headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        DNT: "1",
+        Connection: "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+      },
+      timeout: 30000,
+      maxRedirects: 5,
+    })
+  );
 
   function extractCookieFromPage(pageText) {
-    let nums = pageText.match(/toNumbers\("([a-f0-9]+)"\)/g);
-    if (nums && nums.length >= 3) {
-      const hexes = nums.map(m => m.match(/"([a-f0-9]+)"/)[1]);
-      try {
-        const key = Buffer.from(hexes[0], "hex");
-        const iv = Buffer.from(hexes[1], "hex");
-        const data = Buffer.from(hexes[2], "hex");
-        const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
-        decipher.setAutoPadding(true);
-        let decrypted = decipher.update(data);
-        decrypted = Buffer.concat([decrypted, decipher.final()]);
-        return decrypted.toString("hex");
-      } catch (e) {}
-    }
-    nums = pageText.match(/toNumbers\('([a-f0-9]+)'\)/g);
-    if (nums && nums.length >= 3) {
-      const hexes = nums.map(m => m.match(/'([a-f0-9]+)'/)[1]);
-      try {
-        const key = Buffer.from(hexes[0], "hex");
-        const iv = Buffer.from(hexes[1], "hex");
-        const data = Buffer.from(hexes[2], "hex");
-        const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
-        decipher.setAutoPadding(true);
-        let decrypted = decipher.update(data);
-        decrypted = Buffer.concat([decrypted, decipher.final()]);
-        return decrypted.toString("hex");
-      } catch (e) {}
-    }
-    nums = pageText.match(/toNumbers\s*\(\s*["']([a-f0-9]{32,})["']\s*\)/g);
-    if (nums && nums.length >= 3) {
-      const hexes = nums.map(m => m.match(/["']([a-f0-9]{32,})["']/)[1]);
-      try {
-        const key = Buffer.from(hexes[0], "hex");
-        const iv = Buffer.from(hexes[1], "hex");
-        const data = Buffer.from(hexes[2], "hex");
-        const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
-        decipher.setAutoPadding(true);
-        let decrypted = decipher.update(data);
-        decrypted = Buffer.concat([decrypted, decipher.final()]);
-        return decrypted.toString("hex");
-      } catch (e) {}
-    }
-    nums = pageText.match(/["']([a-f0-9]{32,})["']/g);
-    if (nums && nums.length >= 3) {
-      const hexes = nums.map(m => m.match(/["']([a-f0-9]{32,})["']/)[1]);
-      try {
-        const key = Buffer.from(hexes[0], "hex");
-        const iv = Buffer.from(hexes[1], "hex");
-        const data = Buffer.from(hexes[2], "hex");
-        const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
-        decipher.setAutoPadding(true);
-        let decrypted = decipher.update(data);
-        decrypted = Buffer.concat([decrypted, decipher.final()]);
-        return decrypted.toString("hex");
-      } catch (e) {}
+    const patterns = [
+      /toNumbers\("([a-f0-9]+)"\)/g,
+      /toNumbers\('([a-f0-9]+)'\)/g,
+      /toNumbers\s*\(\s*["']([a-f0-9]{32,})["']\s*\)/g,
+      /["']([a-f0-9]{32,})["']/g,
+    ];
+    for (const pattern of patterns) {
+      const matches = [...pageText.matchAll(pattern)];
+      if (matches.length >= 3) {
+        try {
+          const key = Buffer.from(matches[0][1], "hex");
+          const iv = Buffer.from(matches[1][1], "hex");
+          const data = Buffer.from(matches[2][1], "hex");
+          const decipher = crypto.createDecipheriv("aes-128-cbc", key, iv);
+          decipher.setAutoPadding(true);
+          const decrypted = Buffer.concat([decipher.update(data), decipher.final()]);
+          return decrypted.toString("hex");
+        } catch (e) {
+          console.log("Cookie decrypt failed:", e.message);
+        }
+      }
     }
     return null;
   }
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
-      // GET homepage (cookies will be stored automatically)
-      const page = await client.get(ASMODEUS_BASE + "/");
-      const pageText = page.data;
+      console.log(`\n========== ASMODEUS ATTEMPT ${attempt + 1} ==========`);
 
-      // Check if we need to set the __test cookie
+      // GET homepage
+      console.log("🌐 GET:", ASMODEUS_BASE + "/");
+      const page = await client.get(ASMODEUS_BASE + "/");
+      console.log("Homepage status:", page.status);
+      const pageText = typeof page.data === "string" ? page.data : String(page.data);
+      console.log("Homepage length:", pageText.length);
+
+      // Cookie
       if (!pageText.includes("response-content") && !pageText.includes("deepseek.php")) {
+        console.log("🍪 Asmodeus appears to require __test cookie");
         const cookie = extractCookieFromPage(pageText);
         if (!cookie) {
-          console.log("Asmodeus: Cookie extraction failed");
+          console.log("❌ Cookie extraction failed");
           continue;
         }
-        // Set the __test cookie in the jar
-        await jar.setCookie(`__test=${cookie}`, ASMODEUS_BASE);
-        // Verify cookie
+        console.log("✅ Cookie extracted");
+        await jar.setCookie(`__test=${cookie}; Domain=asmodeus.free.nf; Path=/`, ASMODEUS_BASE + "/");
+        console.log("🍪 Cookie jar:", await jar.getCookieString(ASMODEUS_BASE + "/"));
+
+        // Verify
         const verify = await client.get(ASMODEUS_BASE + "/index.php?i=1");
+        console.log("Cookie verification:", verify.status);
         if (verify.status !== 200) {
-          console.log("Asmodeus: Cookie verification failed");
+          console.log("❌ Cookie verification failed");
           continue;
         }
       }
 
-      // POST to deepseek.php
+      // POST
+      console.log("🚀 POST:", ASMODEUS_BASE + "/deepseek.php");
+      console.log("Model:", MODEL);
+      console.log("Prompt length:", fullPrompt.length);
+
+      const body = new URLSearchParams();
+      body.append("model", MODEL);
+      body.append("question", fullPrompt);
+
       const response = await client.post(
         ASMODEUS_BASE + "/deepseek.php",
-        new URLSearchParams({
-          model: MODEL,
-          question: fullPrompt,
-        }),
+        body.toString(),
         {
           params: { i: "1" },
           headers: {
@@ -253,34 +242,52 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
             Origin: ASMODEUS_BASE,
             Referer: ASMODEUS_BASE + "/",
           },
+          timeout: 90000,
         }
       );
 
-      // Extract response
-      let match = response.data.match(/<div class="response-content">(.*?)<\/div>/is);
+      console.log("✅ Asmodeus HTTP status:", response.status);
+      console.log("Content-Type:", response.headers["content-type"]);
+      const raw = typeof response.data === "string" ? response.data : JSON.stringify(response.data);
+      console.log("Response length:", raw.length);
+      console.log("Response preview:", raw.slice(0, 3000));
+
+      // Parse response-content
+      const match = raw.match(/<div[^>]*class=["']response-content["'][^>]*>([\s\S]*?)<\/div>/i);
       if (match) {
-        let answer = cleanAxiomResponse(match[1]);
-        if (answer && answer.length > 1) {
+        const answer = cleanAxiomResponse(match[1]);
+        console.log("Parsed answer length:", answer.length);
+        if (answer.length > 1) {
+          console.log("✅ Asmodeus response received");
           return answer;
         }
       }
 
-      // Fallback
-      let fallback = response.data;
+      // Fallback parser
+      let fallback = raw;
       fallback = fallback.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gis, "");
       fallback = fallback.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gis, "");
       fallback = fallback.replace(/<[^>]+>/g, " ");
       fallback = fallback.replace(/&nbsp;/g, " ").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&");
       fallback = cleanAxiomResponse(fallback);
       fallback = fallback.replace(/\s+/g, " ").trim();
-      if (fallback && fallback.length > 20 && !fallback.toLowerCase().includes("error")) {
+      if (fallback.length > 20 && !fallback.toLowerCase().includes("error")) {
+        console.log("✅ Asmodeus fallback parser succeeded");
         return fallback;
       }
+
+      console.log("❌ Asmodeus returned no usable answer");
     } catch (err) {
-      console.log(`Asmodeus attempt ${attempt+1} error:`, err.message);
+      console.error(`❌ Asmodeus attempt ${attempt + 1} failed`);
+      console.error("Error:", err.message);
+      console.error("Code:", err.code);
+      console.error("Status:", err.response?.status);
+      console.error("Response:", typeof err.response?.data === "string" ? err.response.data.slice(0, 3000) : err.response?.data);
     }
   }
-  return "Omo, connection no gree. Give me small time, boss man. We go continue.";
+
+  console.log("❌ ALL ASMODEUS ATTEMPTS FAILED");
+  return null;
 }
 
 // ================= MAIN AI =================
@@ -297,8 +304,11 @@ async function askAI(userId, text, isOwner = false) {
 
   let reply = await askGroq(userId, text, history, customPrompt);
   if (!reply) {
-    console.log("Groq failed, falling back to Asmodeus");
+    console.log("🔄 Groq failed, falling back to Asmodeus");
     reply = await askAsmodeus(userId, text, history, customPrompt);
+    if (!reply) {
+      reply = "⚠️ Both AI providers are currently unavailable. Please try again later.";
+    }
   }
 
   history.push({ role: "user", content: text });
@@ -453,6 +463,8 @@ async function startWhatsApp() {
 
       const isOwner = senderNumber === ownerNumber;
 
+      console.log(`📩 Incoming from ${senderNumber}: ${text.slice(0, 50)}...`);
+
       if (isOwner && text.toLowerCase() === ".stop") { global.BOT_PAUSED = true; await sock.sendMessage(remoteJid, { text: "⏸️ Paused." }); return; }
       if (isOwner && text.toLowerCase() === ".start") { global.BOT_PAUSED = false; await sock.sendMessage(remoteJid, { text: "▶️ Resumed." }); return; }
       if (global.BOT_PAUSED) return;
@@ -477,10 +489,16 @@ async function startWhatsApp() {
       await sock.sendPresenceUpdate("composing", remoteJid);
       const userId = isGroup ? `${remoteJid}_${senderJid}` : senderJid;
       const reply = await askAI(userId, text, isOwner);
+      console.log(`🤖 AI reply: ${reply.slice(0, 100)}...`);
+
+      // Send WhatsApp reply
       await sock.sendMessage(remoteJid, { text: reply });
       console.log(`✅ Replied to ${senderJid}`);
     } catch (err) {
-      console.log("Message Error:", err.message);
+      console.error("========== MESSAGE ERROR ==========");
+      console.error(err);
+      console.error("Stack:", err.stack);
+      console.error("===================================");
     }
   });
 
