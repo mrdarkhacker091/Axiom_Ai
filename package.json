@@ -2,6 +2,7 @@
   "name": "axiom-whatsapp-bot",
   "version": "4.0.0",
   "description": "Axiom AI V4 WhatsApp Bot with Telegram pairing and file management",
+  "type": "commonjs",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",

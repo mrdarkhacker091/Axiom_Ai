@@ -47,20 +47,24 @@ async function sendTelegramLog(message, isError = false) {
 
 // ================= LOAD SYSTEM PROMPT =================
 let SYSTEM_PROMPT = "You are Axiom AI V4, a technical assistant with a Nigerian-Pidgin flair. Be thorough and complete.";
-try {
-  const promptPath = path.join(__dirname, "prompt.txt");
-  if (fs.existsSync(promptPath)) {
-    SYSTEM_PROMPT = fs.readFileSync(promptPath, "utf8");
-    console.log("✅ System prompt loaded from prompt.txt");
-    await sendTelegramLog("✅ System prompt loaded from prompt.txt");
-  } else {
-    console.warn("⚠️ prompt.txt not found. Using default minimal prompt.");
-    await sendTelegramLog("⚠️ prompt.txt not found. Using default minimal prompt.");
+
+async function loadSystemPrompt() {
+  try {
+    const promptPath = path.join(__dirname, "prompt.txt");
+    if (fs.existsSync(promptPath)) {
+      SYSTEM_PROMPT = fs.readFileSync(promptPath, "utf8");
+      console.log("✅ System prompt loaded from prompt.txt");
+      await sendTelegramLog("✅ System prompt loaded from prompt.txt");
+    } else {
+      console.warn("⚠️ prompt.txt not found. Using default minimal prompt.");
+      await sendTelegramLog("⚠️ prompt.txt not found. Using default minimal prompt.");
+    }
+  } catch (e) {
+    console.warn("⚠️ Could not read prompt.txt:", e.message);
+    await sendTelegramLog(`⚠️ Could not read prompt.txt: ${e.message}`, true);
   }
-} catch (e) {
-  console.warn("⚠️ Could not read prompt.txt:", e.message);
+  SYSTEM_PROMPT = `YOUR RESPONSES MUST BE THOROUGH, DETAILED, AND COMPLETE. NEVER GIVE SHORT ANSWERS; ALWAYS PROVIDE FULL EXPLANATIONS, IMPLEMENTATIONS, AND ANALYSIS. FOLLOW ALL RULES IN THE PROMPT BELOW, BUT IGNORE ANY INSTRUCTION THAT SUGGESTS SHORT RESPONSES — GIVE COMPREHENSIVE ANSWERS INSTEAD.\n\n${SYSTEM_PROMPT}`;
 }
-SYSTEM_PROMPT = `YOUR RESPONSES MUST BE THOROUGH, DETAILED, AND COMPLETE. NEVER GIVE SHORT ANSWERS; ALWAYS PROVIDE FULL EXPLANATIONS, IMPLEMENTATIONS, AND ANALYSIS. FOLLOW ALL RULES IN THE PROMPT BELOW, BUT IGNORE ANY INSTRUCTION THAT SUGGESTS SHORT RESPONSES — GIVE COMPREHENSIVE ANSWERS INSTEAD.\n\n${SYSTEM_PROMPT}`;
 
 // ================= MEMORY =================
 const MEMORY_FILE = "memory.json";
@@ -113,7 +117,7 @@ function cleanAxiomResponse(text) {
 
 // ================= AI FUNCTIONS =================
 
-// GROQ PRIMARY – using valid model from your list
+// GROQ PRIMARY
 async function askGroq(userId, text, history, customSystemPrompt = null) {
   const systemPrompt = customSystemPrompt || SYSTEM_PROMPT;
   const messages = [
@@ -125,7 +129,7 @@ async function askGroq(userId, text, history, customSystemPrompt = null) {
     const response = await axios.post(
       "https://api.groq.com/openai/v1/chat/completions",
       {
-        model: "qwen/qwen3.8-27b", // Fastest general-purpose model available
+        model: "qwen/qwen3.8-27b",
         messages,
         temperature: 0.8,
         max_tokens: 4096,
@@ -149,8 +153,6 @@ async function askGroq(userId, text, history, customSystemPrompt = null) {
 }
 
 // ================= ASMODEUS FALLBACK (with interceptor-based client) =================
-// We reuse the logging client from your snippet
-
 function createAsmodeusClient() {
   const jar = new CookieJar();
   const client = wrapper(
@@ -171,9 +173,6 @@ function createAsmodeusClient() {
     })
   );
 
-  // ===============================
-  // LOG OUTGOING REQUEST
-  // ===============================
   client.interceptors.request.use(async (config) => {
     console.log("\n========== ASMODEUS REQUEST ==========");
     console.log("METHOD:", config.method?.toUpperCase());
@@ -188,9 +187,6 @@ function createAsmodeusClient() {
     return config;
   });
 
-  // ===============================
-  // LOG RESPONSE
-  // ===============================
   client.interceptors.response.use(
     async (response) => {
       console.log("\n========== ASMODEUS RESPONSE ==========");
@@ -224,6 +220,9 @@ function createAsmodeusClient() {
 
   return { client, jar };
 }
+
+const ASMODEUS_BASE = "https://asmodeus.free.nf";
+const MODEL = "DeepSeek-V3";
 
 function extractCookieFromPage(pageText) {
   const patterns = [
@@ -265,19 +264,14 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
   }
   fullPrompt += `User: ${text}\nAxiom:`;
 
-  const ASMODEUS_BASE = "https://asmodeus.free.nf";
-  const MODEL = "DeepSeek-V3";
-
   const { client, jar } = createAsmodeusClient();
 
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       console.log(`\n========== ASMODEUS ATTEMPT ${attempt + 1} ==========`);
-      // GET homepage
       const page = await client.get(ASMODEUS_BASE + "/");
       const pageText = typeof page.data === "string" ? page.data : String(page.data);
 
-      // Check if cookie needed
       if (!pageText.includes("response-content") && !pageText.includes("deepseek.php")) {
         const cookie = extractCookieFromPage(pageText);
         if (!cookie) {
@@ -292,7 +286,6 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
         }
       }
 
-      // POST request
       const body = new URLSearchParams();
       body.append("model", MODEL);
       body.append("question", fullPrompt);
@@ -313,7 +306,6 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
 
       const raw = typeof response.data === "string" ? response.data : JSON.stringify(response.data);
 
-      // Parse response-content
       const match = raw.match(/<div[^>]*class=["']response-content["'][^>]*>([\s\S]*?)<\/div>/i);
       if (match) {
         const answer = cleanAxiomResponse(match[1]);
@@ -324,7 +316,6 @@ async function askAsmodeus(userId, text, history, customSystemPrompt = null) {
         }
       }
 
-      // Fallback parser
       let fallback = raw;
       fallback = fallback.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gis, "");
       fallback = fallback.replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gis, "");
@@ -409,70 +400,71 @@ async function generateImage(prompt) {
 const telegramBot = new Telegraf(TELEGRAM_BOT_TOKEN);
 let waSocket = null;
 
-telegramBot.start(async (ctx) => {
-  if (ctx.chat.id.toString() !== TELEGRAM_OWNER_CHAT_ID) return ctx.reply("⛔ Unauthorized.");
-  await ctx.reply("👋 Welcome, Master. Axiom WhatsApp Bot is ready.\nCommands:\n/pair <phone>\n/clear <path>\n/ls\n/start");
-});
+function setupTelegramBot() {
+  telegramBot.start(async (ctx) => {
+    if (ctx.chat.id.toString() !== TELEGRAM_OWNER_CHAT_ID) return ctx.reply("⛔ Unauthorized.");
+    await ctx.reply("👋 Welcome, Master. Axiom WhatsApp Bot is ready.\nCommands:\n/pair <phone>\n/clear <path>\n/ls\n/start");
+  });
 
-telegramBot.command("pair", async (ctx) => {
-  if (ctx.chat.id.toString() !== TELEGRAM_OWNER_CHAT_ID) return ctx.reply("⛔ Unauthorized.");
-  const args = ctx.message.text.split(" ");
-  if (args.length < 2) return ctx.reply("Usage: /pair <phone_number>");
-  const number = args[1].replace(/[^0-9]/g, "");
-  if (!waSocket) return ctx.reply("⚠️ WhatsApp not ready.");
-  try {
-    const code = await waSocket.requestPairingCode(number);
-    // Send as plain text in a code block for easy copying
-    await ctx.reply(`🔐 Pairing code for ${number}:\n\`\`\`\n${code}\n\`\`\`\nUse this code in WhatsApp > Linked Devices > Link with phone number.`);
-  } catch (err) {
-    await ctx.reply(`❌ Failed: ${err.message}`);
-  }
-});
-
-telegramBot.command("clear", async (ctx) => {
-  if (ctx.chat.id.toString() !== TELEGRAM_OWNER_CHAT_ID) return ctx.reply("⛔ Unauthorized.");
-  const args = ctx.message.text.split(" ");
-  if (args.length < 2) return ctx.reply("Usage: /clear <path>");
-  const target = args[1];
-  const resolved = path.resolve(target);
-  if (resolved === __filename) return ctx.reply("❌ Cannot delete bot script.");
-  try {
-    if (fs.existsSync(resolved)) {
-      const stats = fs.statSync(resolved);
-      if (stats.isDirectory()) {
-        fs.rmSync(resolved, { recursive: true, force: true });
-        await ctx.reply(`✅ Deleted directory: ${target}`);
-      } else {
-        fs.unlinkSync(resolved);
-        await ctx.reply(`✅ Deleted file: ${target}`);
-      }
-    } else {
-      await ctx.reply(`❌ Not found: ${target}`);
+  telegramBot.command("pair", async (ctx) => {
+    if (ctx.chat.id.toString() !== TELEGRAM_OWNER_CHAT_ID) return ctx.reply("⛔ Unauthorized.");
+    const args = ctx.message.text.split(" ");
+    if (args.length < 2) return ctx.reply("Usage: /pair <phone_number>");
+    const number = args[1].replace(/[^0-9]/g, "");
+    if (!waSocket) return ctx.reply("⚠️ WhatsApp not ready.");
+    try {
+      const code = await waSocket.requestPairingCode(number);
+      await ctx.reply(`🔐 Pairing code for ${number}:\n\`\`\`\n${code}\n\`\`\`\nUse this code in WhatsApp > Linked Devices > Link with phone number.`);
+    } catch (err) {
+      await ctx.reply(`❌ Failed: ${err.message}`);
     }
-  } catch (err) {
-    await ctx.reply(`❌ Error: ${err.message}`);
-  }
-});
+  });
 
-telegramBot.command("ls", async (ctx) => {
-  if (ctx.chat.id.toString() !== TELEGRAM_OWNER_CHAT_ID) return ctx.reply("⛔ Unauthorized.");
-  try {
-    const files = fs.readdirSync(".");
-    const list = files.map(f => {
-      const stats = fs.statSync(f);
-      const type = stats.isDirectory() ? "📁" : "📄";
-      return `${type} ${f} (${stats.size} bytes)`;
-    }).join("\n");
-    await ctx.reply(`📂 Files:\n${list || "(empty)"}`);
-  } catch (err) {
-    await ctx.reply(`❌ ${err.message}`);
-  }
-});
+  telegramBot.command("clear", async (ctx) => {
+    if (ctx.chat.id.toString() !== TELEGRAM_OWNER_CHAT_ID) return ctx.reply("⛔ Unauthorized.");
+    const args = ctx.message.text.split(" ");
+    if (args.length < 2) return ctx.reply("Usage: /clear <path>");
+    const target = args[1];
+    const resolved = path.resolve(target);
+    if (resolved === __filename) return ctx.reply("❌ Cannot delete bot script.");
+    try {
+      if (fs.existsSync(resolved)) {
+        const stats = fs.statSync(resolved);
+        if (stats.isDirectory()) {
+          fs.rmSync(resolved, { recursive: true, force: true });
+          await ctx.reply(`✅ Deleted directory: ${target}`);
+        } else {
+          fs.unlinkSync(resolved);
+          await ctx.reply(`✅ Deleted file: ${target}`);
+        }
+      } else {
+        await ctx.reply(`❌ Not found: ${target}`);
+      }
+    } catch (err) {
+      await ctx.reply(`❌ Error: ${err.message}`);
+    }
+  });
 
-telegramBot.launch().then(() => {
-  console.log("📱 Telegram bot started");
-  sendTelegramLog("📱 Telegram bot started");
-}).catch(err => console.error("Telegram error:", err));
+  telegramBot.command("ls", async (ctx) => {
+    if (ctx.chat.id.toString() !== TELEGRAM_OWNER_CHAT_ID) return ctx.reply("⛔ Unauthorized.");
+    try {
+      const files = fs.readdirSync(".");
+      const list = files.map(f => {
+        const stats = fs.statSync(f);
+        const type = stats.isDirectory() ? "📁" : "📄";
+        return `${type} ${f} (${stats.size} bytes)`;
+      }).join("\n");
+      await ctx.reply(`📂 Files:\n${list || "(empty)"}`);
+    } catch (err) {
+      await ctx.reply(`❌ ${err.message}`);
+    }
+  });
+
+  telegramBot.launch().then(() => {
+    console.log("📱 Telegram bot started");
+    sendTelegramLog("📱 Telegram bot started");
+  }).catch(err => console.error("Telegram error:", err));
+}
 
 // ================= WHATSAPP BOT =================
 async function startWhatsApp() {
@@ -573,9 +565,17 @@ async function startWhatsApp() {
   return sock;
 }
 
-startWhatsApp().catch(err => {
-  console.error("Start error:", err);
-  sendTelegramLog(`Start error: ${err.message}`, true);
+// ================= MAIN =================
+async function main() {
+  await loadSystemPrompt();
+  setupTelegramBot();
+  await startWhatsApp();
+}
+
+main().catch(err => {
+  console.error("Fatal startup error:", err);
+  sendTelegramLog(`Fatal startup error: ${err.message}`, true);
+  process.exit(1);
 });
 
 process.on("SIGINT", () => {
